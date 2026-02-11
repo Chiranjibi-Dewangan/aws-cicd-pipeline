@@ -175,3 +175,9 @@ terraform.rc
 *.tfvars
 *.tfplan
 
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
