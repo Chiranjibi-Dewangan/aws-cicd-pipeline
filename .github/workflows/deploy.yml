@@ -127,8 +127,6 @@ jobs:
         context: ./app
         push: true
         tags: ${{ steps.image.outputs.full_tag }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
 
   deploy:
     name: Deploy to AWS
