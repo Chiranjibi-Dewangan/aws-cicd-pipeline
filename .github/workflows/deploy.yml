@@ -3,15 +3,15 @@ name: Deploy to AWS
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
+  ENVIRONMENT: dev
 
 jobs:
-  lint-and-build:
-    name: Lint and Build
+  build-and-test:
+    name: Build and Test Image
     runs-on: ubuntu-latest
     
     steps:
@@ -21,28 +21,29 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     
-    - name: Lint Dockerfile
-      run: |
-        docker run --rm -i hadolint/hadolint < app/Dockerfile || true
-    
-    - name: Build Docker image (test)
-      run: |
-        cd app
-        docker build -t test-build .
+    - name: Build Docker image
+      working-directory: ./app
+      run: docker build -t app:test .
     
     - name: Test Docker image
       run: |
-        docker run -d -p 3000:3000 --name test-container test-build
+        docker run -d -p 3000:3000 --name test-app app:test
         sleep 10
         curl -f http://localhost:3000/health || exit 1
-        docker stop test-container
+        docker stop test-app
+        echo "✅ Image test passed"
 
-  # CHANGED: Create infrastructure first (without plan file)
-  create-infrastructure:
-    name: Create AWS Infrastructure
+  deploy-infrastructure:
+    name: Deploy Infrastructure
     runs-on: ubuntu-latest
-    needs: lint-and-build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    
+    outputs:
+      ecr_repository: ${{ steps.outputs.outputs.ecr_repository }}
+      alb_dns: ${{ steps.outputs.outputs.alb_dns }}
     
     steps:
     - name: Checkout code
@@ -59,6 +60,7 @@ jobs:
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: 1.6.0
+        terraform_wrapper: false
     
     - name: Terraform Init
       working-directory: ./terraform
@@ -68,16 +70,29 @@ jobs:
       working-directory: ./terraform
       run: terraform validate
     
-    - name: Terraform Apply (create ECR only on first run)
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+    
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
+    
+    - name: Get Terraform Outputs
+      id: outputs
       working-directory: ./terraform
       run: |
-        terraform apply -auto-approve -target=aws_ecr_repository.app -target=aws_ecr_lifecycle_policy.app || true
+        ECR_REPO=$(terraform output -raw ecr_repository_url)
+        ALB_DNS=$(terraform output -raw alb_dns_name)
+        echo "ecr_repository=${ECR_REPO}" >> $GITHUB_OUTPUT
+        echo "alb_dns=${ALB_DNS}" >> $GITHUB_OUTPUT
+        echo "📦 ECR Repository: ${ECR_REPO}"
+        echo "🌐 ALB DNS: ${ALB_DNS}"
 
-  build-and-push:
-    name: Build and Push to ECR
+  push-image:
+    name: Push Image to ECR
     runs-on: ubuntu-latest
-    needs: create-infrastructure
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: deploy-infrastructure
     
     steps:
     - name: Checkout code
@@ -94,106 +109,44 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
     
-    - name: Build and push Docker image
+    - name: Build and push image
+      env:
+        ECR_REPO: ${{ needs.deploy-infrastructure.outputs.ecr_repository }}
       run: |
-        REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-        REPO="dev-app"
-        TAG="latest"
-        
+        echo "Building and pushing to: ${ECR_REPO}"
         cd app
-        docker build -t ${REGISTRY}/${REPO}:${TAG} .
-        docker push ${REGISTRY}/${REPO}:${TAG}
-        
-        echo "Image pushed: ${REGISTRY}/${REPO}:${TAG}"
-
-  deploy:
-    name: Deploy Full Infrastructure
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment:
-      name: production
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.6.0
-    
-    - name: Terraform Init
-      working-directory: ./terraform
-      run: terraform init
-    
-    # NEW: Fresh plan AFTER image is pushed
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: terraform plan -out=tfplan
-    
-    # NEW: Apply immediately after plan (no time for state to change)
-    - name: Terraform Apply
-      working-directory: ./terraform
-      run: terraform apply -auto-approve tfplan
-    
-    - name: Get outputs
-      working-directory: ./terraform
-      run: |
-        echo "ALB_DNS=$(terraform output -raw alb_dns_name)" >> $GITHUB_ENV
-        echo "ECR_REPO=$(terraform output -raw ecr_repository_url)" >> $GITHUB_ENV
-    
-    - name: Display deployment info
-      run: |
-        echo "🚀 Deployment successful!"
-        echo "Application URL: http://${{ env.ALB_DNS }}"
-        echo "ECR Repository: ${{ env.ECR_REPO }}"
+        docker build -t ${ECR_REPO}:latest .
+        docker push ${ECR_REPO}:latest
+        echo "✅ Image pushed successfully"
     
     - name: Trigger instance refresh
       run: |
-        ASG_NAME="dev-app-asg"
-        aws autoscaling start-instance-refresh \
-          --auto-scaling-group-name $ASG_NAME \
-          --preferences '{"MinHealthyPercentage": 50}' || echo "First deployment - no refresh needed"
-
-  # NEW: Separate validation job for PRs
-  validate-only:
-    name: Validate Terraform
-    runs-on: ubuntu-latest
-    needs: lint-and-build
-    if: github.event_name == 'pull_request'
+        ASG_NAME="${{ env.ENVIRONMENT }}-app-asg"
+        
+        # Check if ASG exists
+        if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${ASG_NAME} &>/dev/null; then
+          echo "Triggering instance refresh for ${ASG_NAME}..."
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${ASG_NAME} \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 300}'
+          echo "✅ Instance refresh triggered"
+        else
+          echo "⏭️  Skipping instance refresh (first deployment - instances are launching)"
+        fi
     
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.6.0
-    
-    - name: Terraform Init
-      working-directory: ./terraform
-      run: terraform init
-    
-    - name: Terraform Validate
-      working-directory: ./terraform
-      run: terraform validate
-    
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: terraform plan
+    - name: Display deployment info
+      env:
+        ALB_DNS: ${{ needs.deploy-infrastructure.outputs.alb_dns }}
+      run: |
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🚀 DEPLOYMENT SUCCESSFUL"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Application URL:"
+        echo "http://${ALB_DNS}"
+        echo ""
+        echo "Health Check:"
+        echo "http://${ALB_DNS}/health"
+        echo ""
+        echo "⏳ Note: First deployment takes ~5 minutes for instances to be healthy"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
