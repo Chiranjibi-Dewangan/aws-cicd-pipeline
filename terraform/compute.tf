@@ -150,13 +150,19 @@ resource "aws_autoscaling_group" "app" {
   target_group_arns         = [aws_lb_target_group.app.arn]
   health_check_type         = "ELB"
   health_check_grace_period = 300
-  min_size                  = 2 # Demo: 1 instance for cost savings
+  min_size                  = 1 # Demo: 1 instance for cost savings
   max_size                  = 4
-  desired_capacity          = 2 # Demo: 1 instance for cost savings
+  desired_capacity          = 1 # Demo: 1 instance for cost savings
+  
+  depends_on = [
+    aws_route_table_association.private,
+    aws_lb_listener.http,
+    aws_iam_instance_profile.ec2_profile
+  ]
 
   launch_template {
     id      = aws_launch_template.app.id
-    version = tostring(aws_launch_template.app.latest_version)
+    version = "$Latest"
   }
 
   tag {
