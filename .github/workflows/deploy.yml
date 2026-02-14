@@ -37,10 +37,12 @@ jobs:
         curl -f http://localhost:3000/health || exit 1
         docker stop test-container
 
-  terraform-plan:
-    name: Terraform Plan
+  # CHANGED: Create infrastructure first (without plan file)
+  create-infrastructure:
+    name: Create AWS Infrastructure
     runs-on: ubuntu-latest
     needs: lint-and-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     
     steps:
     - name: Checkout code
@@ -58,10 +60,6 @@ jobs:
       with:
         terraform_version: 1.6.0
     
-    - name: Terraform Format Check
-      working-directory: ./terraform
-      run: terraform fmt -check -recursive || true
-    
     - name: Terraform Init
       working-directory: ./terraform
       run: terraform init
@@ -70,25 +68,16 @@ jobs:
       working-directory: ./terraform
       run: terraform validate
     
-    - name: Terraform Plan
+    - name: Terraform Apply (create ECR only on first run)
       working-directory: ./terraform
-      run: terraform plan -out=tfplan
-    
-    - name: Upload plan
-      uses: actions/upload-artifact@v4
-      with:
-        name: tfplan
-        path: terraform/tfplan
-        retention-days: 5
+      run: |
+        terraform apply -auto-approve -target=aws_ecr_repository.app -target=aws_ecr_lifecycle_policy.app || true
 
   build-and-push:
     name: Build and Push to ECR
     runs-on: ubuntu-latest
-    needs: terraform-plan
+    needs: create-infrastructure
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    
-    outputs:
-      image_tag: ${{ steps.image.outputs.full_tag }}
     
     steps:
     - name: Checkout code
@@ -105,33 +94,22 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
     
-    - name: Get ECR repository name
-      id: ecr-repo
-      run: |
-        REPO_NAME="dev-app"
-        echo "repo_name=${REPO_NAME}" >> $GITHUB_OUTPUT
-    
-    - name: Set image tag
-      id: image
+    - name: Build and push Docker image
       run: |
         REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-        REPO="${{ steps.ecr-repo.outputs.repo_name }}"
+        REPO="dev-app"
         TAG="latest"
-        FULL_TAG="${REGISTRY}/${REPO}:${TAG}"
-        echo "full_tag=${FULL_TAG}" >> $GITHUB_OUTPUT
-        echo "Image will be tagged as: ${FULL_TAG}"
-    
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: ./app
-        push: true
-        tags: ${{ steps.image.outputs.full_tag }}
+        
+        cd app
+        docker build -t ${REGISTRY}/${REPO}:${TAG} .
+        docker push ${REGISTRY}/${REPO}:${TAG}
+        
+        echo "Image pushed: ${REGISTRY}/${REPO}:${TAG}"
 
   deploy:
-    name: Deploy to AWS
+    name: Deploy Full Infrastructure
     runs-on: ubuntu-latest
-    needs: [terraform-plan, build-and-push]
+    needs: build-and-push
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: production
@@ -156,12 +134,12 @@ jobs:
       working-directory: ./terraform
       run: terraform init
     
-    - name: Download plan
-      uses: actions/download-artifact@v4
-      with:
-        name: tfplan
-        path: terraform/
+    # NEW: Fresh plan AFTER image is pushed
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
     
+    # NEW: Apply immediately after plan (no time for state to change)
     - name: Terraform Apply
       working-directory: ./terraform
       run: terraform apply -auto-approve tfplan
@@ -183,4 +161,39 @@ jobs:
         ASG_NAME="dev-app-asg"
         aws autoscaling start-instance-refresh \
           --auto-scaling-group-name $ASG_NAME \
-          --preferences '{"MinHealthyPercentage": 50}' || echo "ASG not found yet - first deployment"
+          --preferences '{"MinHealthyPercentage": 50}' || echo "First deployment - no refresh needed"
+
+  # NEW: Separate validation job for PRs
+  validate-only:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    needs: lint-and-build
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+    
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+    
+    - name: Terraform Validate
+      working-directory: ./terraform
+      run: terraform validate
+    
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan
