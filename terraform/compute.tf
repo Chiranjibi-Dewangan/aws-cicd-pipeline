@@ -103,6 +103,9 @@ resource "aws_launch_template" "app" {
   image_id      = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
 
+  # Force recreation when user_data.sh changes
+  description   = "Launch template - user_data hash: ${filemd5("${path.module}/user_data.sh")}"
+
   iam_instance_profile {
     name = aws_iam_instance_profile.ec2_profile.name
   }
