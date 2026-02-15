@@ -19,6 +19,10 @@ systemctl start docker
 systemctl enable docker
 usermod -a -G docker ec2-user
 
+# Install unzip first (required for AWS CLI install)
+echo "Installing unzip..."
+dnf install -y unzip
+
 # Install AWS CLI v2
 echo "Installing AWS CLI..."
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
